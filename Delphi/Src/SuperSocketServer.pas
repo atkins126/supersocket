@@ -34,6 +34,7 @@ type
     procedure SetUserName(const Value: string);
     function GetRemoteIP: string;
     procedure SetRemoteIP(const Value: string);
+    function GetIsAvailable: boolean;
   public
     constructor Create;
     destructor Destroy; override;
@@ -61,9 +62,12 @@ type
     RoomID : string;
     Room : TObject;
     UserPW : string;
-
+  public
     /// Indicates whether the current connection is connected.
     property IsConnected : boolean read GetIsConnected;
+
+    /// Indicates whether the current connection is Logined and connected.
+    property IsAvailable : boolean read GetIsAvailable;
 
     /// The unique ID of the current connection assigned in TConnectionList.
     property ID : integer read FID;
@@ -134,7 +138,7 @@ type
     FPort : integer;
     FCompletionPort : THandle;
     FIODataPool : TIODataPool;
-    FMemoryPool : TMemoryPool;
+    FMemoryRecylce : TMemoryRecylce;
     procedure do_FireDisconnectEvent(AIOData:PIOData);
   strict private
     FSimpleThread : TSimpleThread;
@@ -384,6 +388,11 @@ begin
   Result := FSocket <> INVALID_SOCKET;
 end;
 
+function TConnection.GetIsAvailable: boolean;
+begin
+  Result := IsLogined and (FSocket <> INVALID_SOCKET);
+end;
+
 function TConnection.GetIsMuted: boolean;
 begin
   Result := UserData.Booleans['is_muted'];
@@ -526,8 +535,11 @@ begin
     if ASimpleThread.Terminated then Break;
 
     if NewSocket = INVALID_SOCKET then begin
+      {$IFDEF DEBUG}
       LastError := WSAGetLastError;
       Trace(Format('TListener.on_FSimpleThread_Execute - %s', [SysErrorMessage(LastError)]));
+      {$ENDIF}
+
       Continue;
     end;
 
@@ -564,7 +576,9 @@ var
   pData : PIOData;
 begin
   if CreateIoCompletionPort(ASocket, FCompletionPort, 0, 0) = 0 then begin
+    {$IFDEF DEBUG}
     Trace('TSuperSocketServer.CreateIoCompletionPort Error');
+    {$ENDIF}
 
     closesocket(ASocket);
     Exit;
@@ -576,7 +590,9 @@ begin
   pData^.RemoteIP := ARemoteIP;
 
   if not PostQueuedCompletionStatus(FCompletionPort, SizeOf(pData), 0, POverlapped(pData)) then begin
+    {$IFDEF DEBUG}
     Trace('TSuperSocketServer.Accepted - PostQueuedCompletionStatus Error');
+    {$ENDIF}
 
     closesocket(ASocket);
     FIODataPool.Release(pData);
@@ -588,7 +604,7 @@ begin
   FCompletionPort := CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
 
   FIODataPool := TIODataPool.Create;
-  FMemoryPool := TMemoryPool.Create;
+  FMemoryRecylce := TMemoryRecylce.Create;
   FSimpleThread := TSimpleThread.Create('TSuperSocketServer.CompletePort', on_FSimpleThread_Execute);
 end;
 
@@ -597,7 +613,7 @@ begin
   FSimpleThread.TerminateNow;
 
   FreeAndNil(FIODataPool);
-  FreeAndNil(FMemoryPool);
+  FreeAndNil(FMemoryRecylce);
   CloseHandle(FCompletionPort);
 
   inherited;
@@ -612,7 +628,9 @@ begin
   pData^.Connection := AConnection;
 
   if not PostQueuedCompletionStatus(FCompletionPort, SizeOf(pData), 0, POverlapped(pData)) then begin
+    {$IFDEF DEBUG}
     Trace('TSuperSocketServer.Disconnect - PostQueuedCompletionStatus Error');
+    {$ENDIF}
 
     FIODataPool.Release(pData);
   end;
@@ -644,10 +662,12 @@ begin
 
     isCondition := ((Transferred = 0) or (not isGetOk));
     if isCondition then begin
+      {$IFDEF DEBUG}
       if not isGetOk then begin
         LastError := WSAGetLastError;
         Trace(Format('TSuperSocketServer.on_FSimpleThread_Execute - %s', [SysErrorMessage(LastError)]));
       end;
+      {$ENDIF}
 
       do_FireDisconnectEvent(pData);
       FIODataPool.Release(pData);
@@ -673,7 +693,7 @@ begin
       ioRecv: begin
         Receive(pData^.Connection);
         if Assigned(FOnReceived) then FOnReceived(Transferred, pData);
-        FMemoryPool.Release(pData.wsaBuffer.buf);
+        FMemoryRecylce.Release(pData.wsaBuffer.buf);
       end;
 
       ioDisconnect: do_FireDisconnectEvent(pData);
@@ -694,7 +714,7 @@ begin
   if AConnection.FSocket = INVALID_SOCKET then Exit;
 
   pData := FIODataPool.Get;
-  PData^.wsaBuffer.buf := FMemoryPool.Get;
+  PData^.wsaBuffer.buf := FMemoryRecylce.Get;
   pData^.wsaBuffer.len := PACKET_SIZE;
   pData^.Status := ioRecv;
   pData^.Connection := AConnection;
@@ -705,7 +725,9 @@ begin
   if recv_ret = SOCKET_ERROR then begin
     LastError := WSAGetLastError;
     if LastError <> ERROR_IO_PENDING then begin
-      Trace(Format('TCompletePort.Receive - %s', [SysErrorMessage(LastError)]));
+      {$IFDEF DEBUG}
+      Trace( Format('TCompletePort.Receive - %s', [SysErrorMessage(LastError)]) );
+      {$ENDIF}
 
       do_FireDisconnectEvent(pData);
       FIODataPool.Release(pData);
@@ -722,6 +744,11 @@ var
 begin
   if AConnection.FSocket = INVALID_SOCKET then Exit;
 
+  if ASize > PACKET_SIZE then begin
+    Trace( Format('TCompletePort.Send - Size(%s) > PACKET_SIZE', [ASize]) );
+    Exit;
+  end;
+
   pData := FIODataPool.Get;
   PData^.wsaBuffer.buf := AData;
   pData^.wsaBuffer.len := ASize;
@@ -734,7 +761,9 @@ begin
   if ErrorCode = SOCKET_ERROR then begin
     LastError := WSAGetLastError;
     if LastError <> ERROR_IO_PENDING then begin
-      Trace(Format('TCompletePort.Send - %s', [SysErrorMessage(LastError)]));
+      {$IFDEF DEBUG}
+      Trace( Format('TCompletePort.Send - %s', [SysErrorMessage(LastError)]) );
+      {$ENDIF}
 
       do_FireDisconnectEvent(pData);
       FIODataPool.Release(pData);
@@ -752,7 +781,9 @@ begin
   pData^.Status := ioStart;
 
   if not PostQueuedCompletionStatus(FCompletionPort, SizeOf(pData), 0, POverlapped(pData)) then begin
+    {$IFDEF DEBUG}
     Trace('TCompletePort.Start - PostQueuedCompletionStatus Error');
+    {$ENDIF}
 
     FIODataPool.Release(pData);
   end;
@@ -766,7 +797,9 @@ begin
   pData^.Status := ioStop;
 
   if not PostQueuedCompletionStatus(FCompletionPort, SizeOf(pData), 0, POverlapped(pData)) then begin
+    {$IFDEF DEBUG}
     Trace('TCompletePort.Stop - PostQueuedCompletionStatus Error');
+    {$ENDIF}
 
     FIODataPool.Release(pData);
   end;
@@ -784,7 +817,9 @@ begin
   pData^.EventData := AEventData;
 
   if not PostQueuedCompletionStatus(FCompletionPort, SizeOf(pData), 0, POverlapped(pData)) then begin
+    {$IFDEF DEBUG}
     Trace('TCompletePort.Stop - PostQueuedCompletionStatus Error');
+    {$ENDIF}
 
     FIODataPool.Release(pData);
   end;
@@ -868,7 +903,7 @@ begin
   for Loop := 0 to CONNECTION_POOL_SIZE-1 do begin
     Connection := FConnections[Loop];
     if Connection.FID = 0 then Continue;
-    if Connection.IsLogined = false then Continue;
+    if Connection.IsAvailable = false then Continue;
     if Connection.FSocket = INVALID_SOCKET then Continue;
 
     if Connection.UserID = AUserID then begin
@@ -937,8 +972,7 @@ begin
           Connection := ConnectionList.Items[Loop];
 
           if Connection = nil then Continue;
-          if Connection.FSocket = INVALID_SOCKET then Continue;
-          if Connection.IsLogined = false then Continue;
+          if Connection.IsAvailable = false then Continue;
 
           {$IFDEF DEBUG}
           //Trace( Format('TConnection - IdleCount (%d, %d)', [Connection.ID, Connection.IdleCount]) );
@@ -990,7 +1024,10 @@ begin
   Connection := FConnectionList.Add(AIOData^.Socket, AIOData^.RemoteIP);
 
   if Connection = nil then begin
+    {$IFDEF DEBUG}
     Trace('TSuperSocketServer.on_FCompletePort_Accepted - Connection = nil');
+    {$ENDIF}
+
     closesocket(AIOData^.Socket);
     Exit;
   end;

@@ -21,7 +21,11 @@ const
   ERROR_CONNECT = -1;
 
 type
-  TMemoryPool = class
+  {*
+    메모리를 사용후 해제하지 않고 큐에 넣어서 재사용한다.
+    PACKET_SIZE의 같은 크기의 메모리를 재사용하기 위해 사용.
+  }
+  TMemoryRecylce = class
   strict private
     FQueue : TDynamicQueue;
   public
@@ -90,6 +94,17 @@ type
     property BufferSize : integer read FBufferSize;
   end;
 
+  IMemoryPoolObserver = interface
+    ['{8E41C992-E8F5-480E-94F1-D30E738506DB}']
+    procedure MemoryRefresh;
+  end;
+
+  IMemoryPoolControl = interface
+    ['{B763D3F8-CABD-4CBA-82A4-A7B5804232AB}']
+    procedure AddObserver(AObserver:IMemoryPoolObserver);
+    function GetPacketClone(APacket:PPacket):PPacket;
+  end;
+
 var
   WSAData : TWSAData;
   NilPacket : TPacket;
@@ -144,26 +159,31 @@ begin
   setsockopt( ASocket, SOL_SOCKET, SO_LINGER, @Linger, SizeOf(Linger) );
 end;
 
-{ TMemoryPool }
+{ TMemoryRecylce }
 
-constructor TMemoryPool.Create;
+constructor TMemoryRecylce.Create;
 begin
   FQueue := TDynamicQueue.Create(false);
 end;
 
-destructor TMemoryPool.Destroy;
+destructor TMemoryRecylce.Destroy;
 begin
   FreeAndNil(FQueue);
 
   inherited;
 end;
 
-function TMemoryPool.Get: pointer;
+function TMemoryRecylce.Get: pointer;
+const
+   // 돌려 받은 메모리를 바로 다시 할당하지 않도록 버퍼 공간을 둔다.
+   // 혹시라도 아주 짧은 순간에 돌려받은 메모리가 다른 프로세스에서 사용되거나 영향 줄까봐 노파심에
+   // 메모리를 조금 더 사용할 뿐 부정적 영향은 없을 거 같아서 추가된 코드 무시해도 된다.
+   SPARE_SPACE = 1024;
 begin
-  if not FQueue.Pop(Result) then GetMem(Result, PACKET_SIZE);
+  if (FQueue.Count < SPARE_SPACE) or (not FQueue.Pop(Result)) then GetMem(Result, PACKET_SIZE);
 end;
 
-procedure TMemoryPool.Release(AData: pointer);
+procedure TMemoryRecylce.Release(AData: pointer);
 begin
   FQueue.Push(AData);
 end;
@@ -258,7 +278,7 @@ begin
   end;
 
   PacketPtr := Pointer(FOffsetPtr);
-  Result := (FBufferSize > 0) and (FBufferSize >= SizeOf(Word));
+  Result := FBufferSize >= SizeOf(Word);
 end;
 
 procedure TPacketReader.Clear;
@@ -316,8 +336,9 @@ begin
   Result := PacketPtr^.PacketSize <= PACKET_SIZE;
 
   {$IFDEF DEBUG}
-  if Result = false then
+  if Result = false then begin
     Trace( Format('TPacketReader.VerifyPacket - Size: %d', [PacketPtr^.PacketSize]) );
+  end;
   {$ENDIF}
 end;
 
